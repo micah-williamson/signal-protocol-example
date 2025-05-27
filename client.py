@@ -131,7 +131,8 @@ class Client:
             contact.receiving_chains[ephemeral_pub] = MessageChain(
                 chain_key=new_chain_key,
                 ephemeral_pub=ephemeral_pub,
-                message_keys=[]
+                message_keys=[],
+                ratchet_count=0
             )
             # Reset sending fields because we are no longer the sender
             contact.sending_chain_key = None
@@ -142,10 +143,20 @@ class Client:
         contact.last_ephemeral_pub = ephemeral_pub
 
         # Ratchet chain key until we have the message keys we need
-        while len(receiving_chain.message_keys) <= encrypted_message.ord:
-            receiving_chain.message_keys.append(self._get_message_key(receiving_chain.chain_key))
+        rc = receiving_chain.ratchet_count
+        while rc < encrypted_message.ord:
+            rc += 1
+            receiving_chain.message_keys.append(
+                (rc, self._get_message_key(receiving_chain.chain_key))
+            )
             receiving_chain.chain_key = self._ratchet(receiving_chain.chain_key)
-        message_key = receiving_chain.message_keys[encrypted_message.ord]
+        receiving_chain.ratchet_count = rc
+        
+        # Find matching message key and remove it
+        message_key_pair = [mk for mk in receiving_chain.message_keys
+                            if mk[0] == encrypted_message.ord][0]
+        message_key = message_key_pair[1]
+        receiving_chain.message_keys.remove(message_key_pair)
         
         # Decrypt with message 
         decrypted_message_text = self._decrypt_message(message_key, encrypted_message)
@@ -187,7 +198,8 @@ class Client:
                 ephemeral_pub: MessageChain(
                     chain_key=chain_key,
                     ephemeral_pub=ephemeral_pub,
-                    message_keys=[]
+                    message_keys=[],
+                    ratchet_count=0
                 )
             },
             last_ephemeral_pub=ephemeral_pub
@@ -240,6 +252,7 @@ class Client:
         message_key = self._get_message_key(chain_key)
         (iv, mac, ciphertext) = encrypted_message = self._encrypt_message(message_key, message)
 
+        contact.sending_ord += 1
         encrypted_message = EncryptedMessage(
             ord=contact.sending_ord,
             iv=iv,
@@ -248,7 +261,6 @@ class Client:
             ephemeral_pub=ephemeral_priv.public_key
         )
         contact.sending_chain_key = self._ratchet(chain_key)
-        contact.sending_ord += 1
 
         return encrypted_message
 

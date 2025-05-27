@@ -1,8 +1,3 @@
-# TODO
-
-* Drop used message keys
-
-
 # Signal Protocol Example
 
 Minimal implementation of signal protocol described in https://www.whatsapp.com/security/WhatsApp-Security-Whitepaper.pdf
