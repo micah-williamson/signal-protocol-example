@@ -34,7 +34,11 @@ class Client:
     _i_pub_key: VerifyKey
 
     _signed_pre_key: tuple[PrivateKey, PublicKey, SignedMessage]
+
+    # Genererated one-time pre keys shared with the server. Used for reverse pub->priv otpk lookup
     _one_time_pre_keys: list[tuple[PrivateKey, PublicKey]]
+
+    # Server connection
     _server: Server
 
     _contacts: dict[str, ClientContact]
@@ -86,8 +90,6 @@ class Client:
         
         contact = self._contacts[envelope.from_]
         encrypted_message = envelope.encrypted_message
-        
-        # TODO: Verify hmac
 
         # Ratchet chain key until we have the message keys we need
         while len(contact.message_keys) <= encrypted_message.ord:
@@ -220,6 +222,15 @@ class Client:
     def _decrypt_message(self, message_key: bytes, encrypted_message: EncryptedMessage) -> bytes:
         iv = encrypted_message.iv
         aes_key = message_key[:32]
+        hmac_key = message_key[32:]
+
+        # Verify
+        verifier = hmac.HMAC(hmac_key, hashes.SHA256())
+        verifier.update(iv + encrypted_message.ciphertext)
+        try:
+            verifier.verify(encrypted_message.mac)
+        except Exception:
+            raise Exception("HMAC verification failed on")
 
         # Decrypt
         ciphertext = encrypted_message.ciphertext

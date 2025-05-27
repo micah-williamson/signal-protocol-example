@@ -1,6 +1,5 @@
 # TODO
 
-* Add hmac verification
 * Support different chain key per sender
 * Change ephemeral key and recalculate root key and chain key when a response is received
 * Drop used message keys
