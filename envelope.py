@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
-from nacl.signing import VerifyKey, SignedMessage
+from nacl.signing import VerifyKey
 from nacl.public import PublicKey
 from dataclasses import dataclass
 
@@ -8,8 +8,13 @@ from dataclasses import dataclass
 @dataclass
 class SessionInitMetadata:
     i_pub_key: VerifyKey
-    ephemeral_pub: PublicKey
     otpk_pub: PublicKey
+
+@dataclass
+class MessageChain:
+    chain_key: bytes
+    ephemeral_pub: PublicKey
+    message_keys: list[bytes]
 
 @dataclass
 class EncryptedMessage:
@@ -17,6 +22,7 @@ class EncryptedMessage:
     iv: bytes
     mac: bytes
     ciphertext: bytes
+    ephemeral_pub: PublicKey
 
 @dataclass
 class ClientEnvelope:

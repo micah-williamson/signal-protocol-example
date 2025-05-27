@@ -11,6 +11,12 @@ def main():
     alice.connect(server)
 
     bob.send('@alice', b'Hello alice')
+    bob.send('@alice', b'It is a fine day')
+
+    alice.send('@bob', b'It is a fine day, Bob.')
+    alice.send('@bob', b'What is 1+1?')
+
+    bob.send('@alice', b'It is 2')
 
 
 if __name__ == '__main__':

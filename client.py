@@ -10,17 +10,27 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, hmac, padding
 from cryptography.hazmat.backends import default_backend
 
-from envelope import ClientEnvelope, EncryptedMessage, SessionInitMetadata
+from envelope import ClientEnvelope, EncryptedMessage, MessageChain, SessionInitMetadata
 from server import Server
 
 @dataclass
 class ClientContact:
     name: str
+
+    # Shared root key secret
     root_key: bytes
-    chain_key: bytes
-    message_keys: list[bytes]
-    # Client confirmed has initiated e2ee. While FALSE messages will send with init metadata
-    confirmed: bool
+
+    # Sending chain and ephemeral keys may be optional if we are not the last sender
+    sending_chain_key: Optional[bytes]
+    sending_ephemeral_priv: Optional[PrivateKey]
+    sending_ord: int
+
+    # Receiving chain keyed off of ephemeral public key. Receiving chains will be kept this way
+    # in case we receive out of order messages we can still decrypt those messages. The last 
+    # ephemeral pub is also tracked so root key ratcheting can be performed
+    receiving_chains: dict[PublicKey, MessageChain]
+    last_ephemeral_pub: Optional[PublicKey]
+
     # Initiator fields. These values only exist if WE initiated the chat.
     session_init_metadata: Optional[SessionInitMetadata] = None
 
@@ -66,9 +76,26 @@ class Client:
         contact = self._contacts[recipient]
 
         session_init_metadata = None
-        if not contact.confirmed:
-            self._print(f"Sending session init metadata")
+        if not contact.receiving_chains:
+            # If there are no receiving chains then we need to continue sending the init metadata
+            # so the receiving can create their first sending (our receiving) chain
             session_init_metadata = contact.session_init_metadata
+        
+        if contact.sending_chain_key == None:
+            self._print("Taking over as sender and ratcheting root key")
+            last_ephemeral_pub = contact.last_ephemeral_pub
+            if last_ephemeral_pub is None:
+                raise Exception("Unable to ratchet root key. No last_ephemeral_pub")
+
+            new_ephemeral_priv = PrivateKey.generate()
+            new_shared_secret = crypto_scalarmult(new_ephemeral_priv.encode(), 
+                                                  last_ephemeral_pub.encode())
+            new_root_key, new_chain_key = self._gen_root_and_chain_key(new_shared_secret, 
+                                                                       salt=contact.root_key)
+            contact.root_key = new_root_key
+            contact.sending_chain_key = new_chain_key
+            contact.sending_ephemeral_priv = new_ephemeral_priv
+            contact.sending_ord = 0
 
         encrypted_message = self._do_encrypt_and_ratchet(message, contact)
         envelope = ClientEnvelope(
@@ -84,48 +111,67 @@ class Client:
 
         if envelope.from_ not in self._contacts:
             self._print(f"New contact. Initializing session")
-            sim = envelope.session_init_metadata
-            assert sim is not None
-            self._init_session_as_recipient(envelope.from_, sim)
+            self._init_session_as_recipient(envelope.from_, envelope)
         
         contact = self._contacts[envelope.from_]
         encrypted_message = envelope.encrypted_message
 
+        ephemeral_pub = encrypted_message.ephemeral_pub
+        if ephemeral_pub not in contact.receiving_chains:
+            self._print("Got new ephemeral key from sender. Ratcheting root key")
+            sending_ephemeral_priv = contact.sending_ephemeral_priv
+            if sending_ephemeral_priv is None:
+                raise Exception("Unable to ratchet root key. No sending_ephemeral_priv")
+            
+            new_shared_secret = crypto_scalarmult(sending_ephemeral_priv.encode(), 
+                                                  ephemeral_pub.encode())
+            new_root_key, new_chain_key = self._gen_root_and_chain_key(new_shared_secret, 
+                                                                       salt=contact.root_key)
+            contact.root_key = new_root_key
+            contact.receiving_chains[ephemeral_pub] = MessageChain(
+                chain_key=new_chain_key,
+                ephemeral_pub=ephemeral_pub,
+                message_keys=[]
+            )
+            # Reset sending fields because we are no longer the sender
+            contact.sending_chain_key = None
+            contact.sending_ephemeral_priv = None
+            contact.sending_ord = 0
+
+        receiving_chain = contact.receiving_chains[ephemeral_pub]
+        contact.last_ephemeral_pub = ephemeral_pub
+
         # Ratchet chain key until we have the message keys we need
-        while len(contact.message_keys) <= encrypted_message.ord:
-            contact.message_keys.append(self._get_message_key(contact.chain_key))
-            contact.chain_key = self._ratchet(contact.chain_key)
-        
-        message_key = contact.message_keys[encrypted_message.ord]
+        while len(receiving_chain.message_keys) <= encrypted_message.ord:
+            receiving_chain.message_keys.append(self._get_message_key(receiving_chain.chain_key))
+            receiving_chain.chain_key = self._ratchet(receiving_chain.chain_key)
+        message_key = receiving_chain.message_keys[encrypted_message.ord]
         
         # Decrypt with message 
         decrypted_message_text = self._decrypt_message(message_key, encrypted_message)
         
         self._print(f"Got decrypted message: {decrypted_message_text}")                   
 
-    def _init_session_as_recipient(self, initiator: str, sim: SessionInitMetadata):
+    def _init_session_as_recipient(self, initiator: str, envelope: ClientEnvelope):
+        sim = envelope.session_init_metadata
+        if sim is None:
+            raise Exception("Session init metadata not found")
+        
         self._print(f"Initializing chat session with {initiator} as recipient")
         i_priv_key = self._i_priv_key.to_curve25519_private_key()
         s_i_pub_key = sim.i_pub_key.to_curve25519_public_key()
         pre_key_priv = self._signed_pre_key[0]
+        ephemeral_pub = envelope.encrypted_message.ephemeral_pub
 
         otpk_priv = [otpk[0] for otpk in self._one_time_pre_keys if otpk[1] == sim.otpk_pub][0]
         dh1 = crypto_scalarmult(pre_key_priv.encode(), s_i_pub_key.encode())
-        dh2 = crypto_scalarmult(i_priv_key.encode(), sim.ephemeral_pub.encode())
-        dh3 = crypto_scalarmult(pre_key_priv.encode(), sim.ephemeral_pub.encode())
-        dh4 = crypto_scalarmult(otpk_priv.encode(), sim.ephemeral_pub.encode())
+        dh2 = crypto_scalarmult(i_priv_key.encode(), ephemeral_pub.encode())
+        dh3 = crypto_scalarmult(pre_key_priv.encode(), ephemeral_pub.encode())
+        dh4 = crypto_scalarmult(otpk_priv.encode(), ephemeral_pub.encode())
         master_secret = dh1 + dh2 + dh3 + dh4
 
         # Generate session keys
-        deriver = HKDF(
-            algorithm=hashes.SHA256(),
-            length=64,
-            info=b"WhisperText",
-            salt=b'\x00' * 32
-        )
-        root_and_chain = deriver.derive(master_secret)
-        root_key = root_and_chain[:32]
-        chain_key = root_and_chain[32:]
+        root_key, chain_key = self._gen_root_and_chain_key(master_secret)
 
         self._print(f"Generated master secret: {master_secret}")
         self._print(f"Generated Root Key: {root_key}")
@@ -134,9 +180,17 @@ class Client:
         self._contacts[initiator] = ClientContact(
             name=initiator,
             root_key=root_key,
-            chain_key=chain_key,
-            message_keys=[],
-            confirmed=True
+            sending_chain_key=None,
+            sending_ephemeral_priv=None,
+            sending_ord=0,
+            receiving_chains={
+                ephemeral_pub: MessageChain(
+                    chain_key=chain_key,
+                    ephemeral_pub=ephemeral_pub,
+                    message_keys=[]
+                )
+            },
+            last_ephemeral_pub=ephemeral_pub
         )
     
     def _init_session_as_initiator(self, recipient: str):
@@ -157,15 +211,7 @@ class Client:
         master_secret = dh1 + dh2 + dh3 + dh4
 
         # Generate session keys
-        deriver = HKDF(
-            algorithm=hashes.SHA256(),
-            length=64,
-            info=b"WhisperText",
-            salt=b'\x00' * 32
-        )
-        root_and_chain = deriver.derive(master_secret)
-        root_key = root_and_chain[:32]
-        chain_key = root_and_chain[32:]
+        root_key, chain_key = self._gen_root_and_chain_key(master_secret)
 
         self._print(f"Generated master secret: {master_secret}")
         self._print(f"Generated Root Key: {root_key}")
@@ -174,28 +220,36 @@ class Client:
         self._contacts[recipient] = ClientContact(
             name=recipient,
             root_key=root_key,
-            chain_key=chain_key,
-            message_keys=[],
+            sending_chain_key=chain_key,
+            sending_ephemeral_priv=ephemeral_key,
+            sending_ord=0,
+            receiving_chains={},
+            last_ephemeral_pub=None,
             session_init_metadata=SessionInitMetadata(
                 i_pub_key=self._i_pub_key,
-                ephemeral_pub=ephemeral_key.public_key,
                 otpk_pub=otpk
-            ),
-            confirmed=False
+            )
         )
 
     def _do_encrypt_and_ratchet(self, message: bytes, contact: ClientContact) -> EncryptedMessage:
-        message_key = self._get_message_key(contact.chain_key)
+        chain_key = contact.sending_chain_key
+        ephemeral_priv = contact.sending_ephemeral_priv
+        if chain_key is None or ephemeral_priv is None:
+            raise Exception("Unable to encrypt message before sending chain/eph is initialized")
+        
+        message_key = self._get_message_key(chain_key)
         (iv, mac, ciphertext) = encrypted_message = self._encrypt_message(message_key, message)
 
         encrypted_message = EncryptedMessage(
-            ord=len(contact.message_keys),
+            ord=contact.sending_ord,
             iv=iv,
             mac=mac,
-            ciphertext=ciphertext
+            ciphertext=ciphertext,
+            ephemeral_pub=ephemeral_priv.public_key
         )
-        contact.message_keys.append(message_key)
-        contact.chain_key = self._ratchet(contact.chain_key)
+        contact.sending_chain_key = self._ratchet(chain_key)
+        contact.sending_ord += 1
+
         return encrypted_message
 
     def _encrypt_message(self, message_key: bytes, plaintext: bytes) -> tuple[bytes, bytes, bytes]:
@@ -243,6 +297,19 @@ class Client:
         plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
 
         return plaintext
+    
+    def _gen_root_and_chain_key(self, shared_secret: bytes, 
+                                salt: Optional[bytes]=None) -> tuple[bytes, bytes]:
+        deriver = HKDF(
+            algorithm=hashes.SHA256(),
+            length=64,
+            info=b"WhisperText",
+            salt=b'\x00' * 32 if salt is None else salt
+        )
+        root_and_chain = deriver.derive(shared_secret)
+        root_key = root_and_chain[:32]
+        chain_key = root_and_chain[32:]
+        return root_key, chain_key
 
     def _get_message_key(self, chain_key: bytes) -> bytes:
         h = hmac.HMAC(chain_key, hashes.SHA256())
