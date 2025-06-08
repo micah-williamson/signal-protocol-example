@@ -9,6 +9,7 @@ from envelope import ClientEnvelope
 @dataclass
 class ServerIdentity:
     name: str
+    companions: list[str]
     i_pub_key: VerifyKey
     pre_pub_key: PublicKey
     pre_signature: SignedMessage
@@ -30,12 +31,24 @@ class Server:
         self._print(f"{name} registered")
         self._users[name] = ServerIdentity(
             name=name,
+            companions=[],
             i_pub_key=i_pub_key,
             pre_pub_key=pre_pub_key,
             pre_signature=pre_signature,
             one_time_pre_keys=one_time_pre_keys,
             receive_sock=receive_sock
         )
+    
+    def set_companions(self, primary: str, companions: list[str]):
+        for companion in companions:
+            if companion not in self._users:
+                raise Exception(
+                    'Companion must call register() first before it can be added as a companion'
+                )
+        self._users[primary].companions = companions
+
+    def query_companions(self, primary: str):
+        return self._users[primary].companions
     
     def chat_init(self, recipient: str) -> tuple[VerifyKey, PublicKey, SignedMessage, PublicKey]:
         self._print(f"Chat init requested for {recipient}")
@@ -51,7 +64,6 @@ class Server:
         self._print(f"Routing message From {envelope.from_} to {envelope.to}")
         server_ident = self._users[envelope.to]
         server_ident.receive_sock(envelope)
-        
 
     def _print(self, message: str):
         print(f"[Server] {message}")

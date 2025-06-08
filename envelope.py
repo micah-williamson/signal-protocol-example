@@ -30,5 +30,6 @@ class EncryptedMessage:
 class ClientEnvelope:
     to: str
     from_: str
+    sender_companions: list[str]
     encrypted_message: EncryptedMessage
     session_init_metadata: Optional[SessionInitMetadata]

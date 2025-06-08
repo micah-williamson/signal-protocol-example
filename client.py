@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from hmac import HMAC
 import os
@@ -16,6 +17,7 @@ from server import Server
 @dataclass
 class ClientContact:
     name: str
+    companions: list[str]
 
     # Shared root key secret
     root_key: bytes
@@ -37,7 +39,8 @@ class ClientContact:
 @dataclass
 class Client:
 
-    _name: str
+    name: str
+    _companions: list[Client]
 
     # Identity
     _i_priv_key: SigningKey
@@ -54,19 +57,26 @@ class Client:
     _contacts: dict[str, ClientContact]
 
     def __init__(self, name: str):
-        self._name = name
+        self.name = name
         (
             self._i_priv_key, 
             self._i_pub_key
         ) = self._gen_identity()
         self._signed_pre_key = self._gen_signed_pre_key(self._i_priv_key)
         self._one_time_pre_keys = self._gen_one_time_pre_keys()
+        self._companions = []
         self._contacts = {}
 
     def connect(self, server: Server):
         self._server = server
-        server.register(self.receive, self._name, self._i_pub_key, self._signed_pre_key[1], 
+        server.register(self.receive, self.name, self._i_pub_key, self._signed_pre_key[1], 
                         self._signed_pre_key[2], [otpk[1] for otpk in self._one_time_pre_keys])
+            
+        
+    def add_companion(self, companion: Client):
+        companion.connect(self._server)
+        self._companions.append(companion)
+        self._server.set_companions(self.name, [c.name for c in self._companions])
         
     def send(self, recipient: str, message: bytes):
         if recipient not in self._contacts:
@@ -75,6 +85,13 @@ class Client:
         self._print(f"Sending message [to {recipient}]: {message}")
         contact = self._contacts[recipient]
 
+        self._send_single(contact, message)
+
+        for companion in contact.companions:
+            self._print(f"Sending to {recipient} companion: {companion}")
+            self.send(companion, message)
+
+    def _send_single(self, contact: ClientContact, message: bytes):
         session_init_metadata = None
         if not contact.receiving_chains:
             # If there are no receiving chains then we need to continue sending the init metadata
@@ -99,8 +116,9 @@ class Client:
 
         encrypted_message = self._do_encrypt_and_ratchet(message, contact)
         envelope = ClientEnvelope(
-            to=recipient,
-            from_=self._name,
+            to=contact.name,
+            from_=self.name,
+            sender_companions=[c.name for c in self._companions],
             encrypted_message=encrypted_message,
             session_init_metadata=session_init_metadata
         )
@@ -190,6 +208,7 @@ class Client:
 
         self._contacts[initiator] = ClientContact(
             name=initiator,
+            companions=envelope.sender_companions,
             root_key=root_key,
             sending_chain_key=None,
             sending_ephemeral_priv=None,
@@ -231,6 +250,7 @@ class Client:
 
         self._contacts[recipient] = ClientContact(
             name=recipient,
+            companions=[],
             root_key=root_key,
             sending_chain_key=chain_key,
             sending_ephemeral_priv=ephemeral_key,
@@ -352,4 +372,4 @@ class Client:
         return otpks
 
     def _print(self, message: str):
-        print(f"[Client {self._name}] {message}")
+        print(f"[Client {self.name}] {message}")

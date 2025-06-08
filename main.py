@@ -7,6 +7,9 @@ def main():
     bob = Client('@bob')
     bob.connect(server)
 
+    bob_companion = Client('@bob:1')
+    bob.add_companion(bob_companion)
+
     alice = Client('@alice')
     alice.connect(server)
 
